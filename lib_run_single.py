@@ -11,7 +11,11 @@ from lib_results_logger import log_task_completion
 logger = logging.getLogger("desktopenv.experiment")
 
 
-class LLMRetryExhaustedError(RuntimeError):
+class RecoverableModelError(RuntimeError):
+    """A transient model-transport failure that warrants retrying the task."""
+
+
+class LLMRetryExhaustedError(RecoverableModelError):
     """Raised when one benchmark step receives only empty model responses."""
 
 
@@ -29,6 +33,60 @@ def _require_screenshot(obs, context):
     return screenshot
 
 
+def _is_recoverable_model_error(exc):
+    """Return whether an agent exception represents a transient model call."""
+
+    exception_name = type(exc).__name__
+    if exception_name in {
+        "APIConnectionError",
+        "APITimeoutError",
+        "InternalServerError",
+        "RateLimitError",
+        "ReadTimeout",
+        "ConnectTimeout",
+        "ConnectionError",
+        "ConnectionResetError",
+        "Timeout",
+        "TimeoutError",
+    }:
+        return True
+
+    message = str(exc).lower()
+    if any(
+        marker in message
+        for marker in (
+            "iai gateway request failed",
+            "data_inspection_failed",
+            "datainspectionfailed",
+            "streaming error from openai-compatible endpoint",
+            "openai-compatible stream ended without content",
+        )
+    ):
+        return True
+
+    if "non-json response from openai-compatible endpoint" in message and any(
+        marker in message
+        for marker in (
+            "phoenix-gw-eval.alibaba.com",
+            "bxpunish=",
+            "waf_uuid=",
+        )
+    ):
+        return True
+
+    if exception_name == "PermissionDeniedError" and any(
+        marker in message
+        for marker in (
+            "<title>access denied</title>",
+            "error.alibaba.com",
+            "errors.edgesuite.net",
+        )
+    ):
+        return True
+
+    return False
+
+
 def predict_with_retries(agent, instruction, obs, step_idx):
     max_attempts = int(os.getenv("OSWORLD_LLM_MAX_RETRIES_PER_STEP", "3"))
     retry_backoff = float(os.getenv("OSWORLD_LLM_RETRY_BACKOFF_SECONDS", "2"))
@@ -37,8 +95,27 @@ def predict_with_retries(agent, instruction, obs, step_idx):
     if retry_backoff < 0:
         raise ValueError("OSWORLD_LLM_RETRY_BACKOFF_SECONDS cannot be negative")
 
+    last_error = None
     for attempt in range(1, max_attempts + 1):
-        response, actions = agent.predict(instruction, obs)
+        try:
+            response, actions = agent.predict(instruction, obs)
+        except Exception as exc:
+            if not _is_recoverable_model_error(exc):
+                raise
+            last_error = exc
+            logger.warning(
+                "Step %d model attempt %d/%d failed (%s: %s); "
+                "benchmark step not consumed.",
+                step_idx + 1,
+                attempt,
+                max_attempts,
+                type(exc).__name__,
+                exc,
+            )
+            if attempt < max_attempts and retry_backoff:
+                time.sleep(retry_backoff)
+            continue
+
         valid_response = isinstance(response, str) and bool(response.strip())
         if valid_response:
             if not isinstance(actions, list):
@@ -60,10 +137,13 @@ def predict_with_retries(agent, instruction, obs, step_idx):
         if attempt < max_attempts and retry_backoff:
             time.sleep(retry_backoff)
 
-    raise LLMRetryExhaustedError(
+    error = LLMRetryExhaustedError(
         f"Step {step_idx + 1} failed after {max_attempts} model attempts; "
         "no benchmark step was consumed and no result was produced."
     )
+    if last_error is not None:
+        raise error from last_error
+    raise error
 
 
 def run_single_example(agent, env, example, max_steps, instruction, args, example_result_dir, scores):

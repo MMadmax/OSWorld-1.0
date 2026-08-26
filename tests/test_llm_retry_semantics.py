@@ -6,7 +6,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from lib_run_single import LLMRetryExhaustedError, run_single_example
+from lib_run_single import (
+    LLMRetryExhaustedError,
+    RecoverableModelError,
+    _is_recoverable_model_error,
+    run_single_example,
+)
 from mm_agents.agent import PromptAgent
 from mm_agents.qwen.main import QwenAgent
 from PIL import Image
@@ -142,6 +147,81 @@ class LLMRetrySemanticsTest(unittest.TestCase):
             self.assertEqual(agent.calls, 1)
             self.assertEqual(env.evaluate_calls, 1)
             self.assertTrue(os.path.exists(os.path.join(result_dir, "result.txt")))
+
+    def test_transport_exception_retries_without_consuming_step(self):
+        class ReadTimeout(Exception):
+            pass
+
+        class FlakyAgent:
+            calls = 0
+
+            def reset(self, *_args, **_kwargs):
+                pass
+
+            def predict(self, _instruction, _obs):
+                self.calls += 1
+                if self.calls < 3:
+                    raise ReadTimeout("upstream timed out")
+                return "DONE", ["DONE"]
+
+        agent = FlakyAgent()
+        env = FakeEnv()
+        args = SimpleNamespace(sleep_after_execution=0)
+
+        with tempfile.TemporaryDirectory() as result_dir:
+            with patch("lib_run_single.log_task_completion"):
+                run_single_example(
+                    agent,
+                    env,
+                    {"id": "test", "domain": "test"},
+                    1,
+                    "test instruction",
+                    args,
+                    result_dir,
+                    [],
+                )
+
+        self.assertEqual(agent.calls, 3)
+        self.assertEqual(env.evaluate_calls, 1)
+
+    def test_transport_exception_exhaustion_is_task_recoverable(self):
+        class ReadTimeout(Exception):
+            pass
+
+        class FailingAgent:
+            def reset(self, *_args, **_kwargs):
+                pass
+
+            def predict(self, _instruction, _obs):
+                raise ReadTimeout("upstream timed out")
+
+        with tempfile.TemporaryDirectory() as result_dir:
+            with self.assertRaises(RecoverableModelError):
+                run_single_example(
+                    FailingAgent(),
+                    FakeEnv(),
+                    {"id": "test", "domain": "test"},
+                    1,
+                    "test instruction",
+                    SimpleNamespace(sleep_after_execution=0),
+                    result_dir,
+                    [],
+                )
+
+    def test_gateway_waf_html_is_recoverable_but_bad_credentials_are_not(self):
+        waf_error = RuntimeError(
+            "Non-JSON response from OpenAI-compatible endpoint: "
+            "endpoint=http://phoenix-gw-eval.alibaba.com/eval/dashscope/chat/completions, "
+            "status=403, bxpunish=true, waf_uuid=abc"
+        )
+        self.assertTrue(_is_recoverable_model_error(waf_error))
+
+        class PermissionDeniedError(Exception):
+            pass
+
+        self.assertFalse(
+            _is_recoverable_model_error(PermissionDeniedError("invalid API key"))
+        )
 
 
 class PredictionRollbackTest(unittest.TestCase):

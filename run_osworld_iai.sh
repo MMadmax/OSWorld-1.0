@@ -105,7 +105,9 @@ HISTORY_N="${HISTORY_N:-100}"
 IMAGE_MAX="${IMAGE_MAX:-20}"
 FOLD_SIZE="${FOLD_SIZE:-10}"
 REASONING_EFFORT="${REASONING_EFFORT:-xhigh}"
-ENVIRONMENT_RETRIES="${ENVIRONMENT_RETRIES:-2}"
+# TASK_RETRIES is the preferred name. ENVIRONMENT_RETRIES remains supported
+# for compatibility with existing launch commands.
+TASK_RETRIES="${TASK_RETRIES:-${ENVIRONMENT_RETRIES:-2}}"
 SLEEP_AFTER_EXECUTION="${SLEEP_AFTER_EXECUTION:-0}"
 
 TEST_META_PATH="${TEST_META_PATH:-evaluation_examples/test_nogdrive.json}"
@@ -160,7 +162,7 @@ RUN_ARGS=(
   --fold_size "${FOLD_SIZE}"
   --enable_thinking
   --reasoning_effort "${REASONING_EFFORT}"
-  --environment_retries "${ENVIRONMENT_RETRIES}"
+  --task_retries "${TASK_RETRIES}"
   --coord relative
   --base_url "${API_BASE%/}"
   --api_key "${API_KEY}"

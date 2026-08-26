@@ -23,7 +23,7 @@ if os.path.exists(".env"):
 
 import lib_run_single
 from desktop_env.desktop_env import DesktopEnv
-from lib_run_single import RecoverableEnvironmentError
+from lib_run_single import RecoverableEnvironmentError, RecoverableModelError
 from mm_agents.qwen import QwenAgent
 from mm_agents.transports import build_openai_compatible_transport
 
@@ -84,9 +84,14 @@ def config() -> argparse.Namespace:
     parser.add_argument("--num_envs", type=int, default=1)
     parser.add_argument(
         "--environment_retries",
+        "--task_retries",
+        dest="environment_retries",
         type=int,
         default=2,
-        help="Retry a task in a fresh environment after a recoverable desktop-service failure.",
+        help=(
+            "Retry a task in a fresh environment when it exits without result.txt, "
+            "including desktop-service, screenshot, and model-transport failures."
+        ),
     )
     parser.add_argument(
         "--log_level",
@@ -226,7 +231,7 @@ def run_env_tasks(task_queue, run_args: argparse.Namespace, shared_scores: list)
                     except ValueError:
                         pass
             logger.warning(
-                "Recreating %s environment after desktop-service failure.",
+                "Recreating %s environment after recoverable task failure.",
                 current_process().name,
             )
             return create_environment()
@@ -290,11 +295,17 @@ def run_env_tasks(task_queue, run_args: argparse.Namespace, shared_scores: list)
                     example_result_dir,
                     shared_scores,
                 )
-            except RecoverableEnvironmentError as exc:
+            except (RecoverableEnvironmentError, RecoverableModelError) as exc:
                 import traceback
 
+                failure_kind = (
+                    "environment"
+                    if isinstance(exc, RecoverableEnvironmentError)
+                    else "model"
+                )
                 logger.error(
-                    "Recoverable environment failure in %s %s/%s (attempt %d/%d): %s",
+                    "Recoverable %s failure in %s %s/%s (attempt %d/%d): %s",
+                    failure_kind,
                     current_process().name,
                     domain,
                     example_id,
@@ -333,7 +344,7 @@ def run_env_tasks(task_queue, run_args: argparse.Namespace, shared_scores: list)
                     )
                 else:
                     logger.error(
-                        "Environment retry limit exhausted for %s/%s; leaving it unfinished.",
+                        "Recoverable task retry limit exhausted for %s/%s; leaving it unfinished.",
                         domain,
                         example_id,
                     )
@@ -347,9 +358,51 @@ def run_env_tasks(task_queue, run_args: argparse.Namespace, shared_scores: list)
                     env.controller.end_recording(os.path.join(example_result_dir, "recording.mp4"))
                 except Exception:
                     pass
-                with open(os.path.join(example_result_dir, "traj.jsonl"), "a", encoding="utf-8") as file_obj:
-                    file_obj.write(json.dumps({"Error": f"{domain}/{example_id} - {exc}"}, ensure_ascii=False))
-                    file_obj.write("\n")
+                try:
+                    with open(os.path.join(example_result_dir, "traj.jsonl"), "a", encoding="utf-8") as file_obj:
+                        file_obj.write(json.dumps({"Error": f"{domain}/{example_id} - {exc}"}, ensure_ascii=False))
+                        file_obj.write("\n")
+                except Exception:
+                    logger.error("Failed to persist the terminal error for %s/%s.", domain, example_id)
+
+                result_file = os.path.join(example_result_dir, "result.txt")
+                if os.path.exists(result_file):
+                    logger.warning(
+                        "The task raised after writing result.txt; keeping %s/%s completed.",
+                        domain,
+                        example_id,
+                    )
+                    continue
+
+                if environment_retry < run_args.environment_retries:
+                    archive_root = os.path.join(
+                        run_args.result_dir,
+                        "_recoverable_attempts",
+                        domain,
+                        example_id,
+                    )
+                    os.makedirs(archive_root, exist_ok=True)
+                    archive_path = os.path.join(
+                        archive_root,
+                        f"attempt_{environment_retry + 1}_{datetime.datetime.now().strftime('%Y%m%d@%H%M%S')}",
+                    )
+                    if os.path.isdir(example_result_dir):
+                        shutil.move(example_result_dir, archive_path)
+                    task_queue.put((domain, example_id, environment_retry + 1))
+                    logger.warning(
+                        "Requeued %s/%s because the failed attempt produced no result.txt; "
+                        "archived it to %s.",
+                        domain,
+                        example_id,
+                        archive_path,
+                    )
+                else:
+                    logger.error(
+                        "Task retry limit exhausted for %s/%s; leaving it unfinished.",
+                        domain,
+                        example_id,
+                    )
+                env = restart_environment(env)
     finally:
         logger.info("%s cleaning up environment...", current_process().name)
         try:
