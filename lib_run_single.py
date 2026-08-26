@@ -15,6 +15,20 @@ class LLMRetryExhaustedError(RuntimeError):
     """Raised when one benchmark step receives only empty model responses."""
 
 
+class RecoverableEnvironmentError(RuntimeError):
+    """A transient desktop-service failure that warrants a fresh container."""
+
+
+def _require_screenshot(obs, context):
+    screenshot = obs.get("screenshot") if isinstance(obs, dict) else None
+    if not isinstance(screenshot, (bytes, bytearray)) or not screenshot:
+        raise RecoverableEnvironmentError(
+            f"Desktop screenshot unavailable during {context}; "
+            "restart the environment and retry the task"
+        )
+    return screenshot
+
+
 def predict_with_retries(agent, instruction, obs, step_idx):
     max_attempts = int(os.getenv("OSWORLD_LLM_MAX_RETRIES_PER_STEP", "3"))
     retry_backoff = float(os.getenv("OSWORLD_LLM_RETRY_BACKOFF_SECONDS", "2"))
@@ -66,6 +80,7 @@ def run_single_example(agent, env, example, max_steps, instruction, args, exampl
     
     time.sleep(60) # Wait for the environment to be ready
     obs = env._get_obs() # Get the initial observation
+    _require_screenshot(obs, "initial observation")
     done = False
     step_idx = 0
     env.controller.start_recording()
@@ -76,13 +91,14 @@ def run_single_example(agent, env, example, max_steps, instruction, args, exampl
             action_timestamp = datetime.datetime.now().strftime("%Y%m%d@%H%M%S%f")
             logger.info("Step %d: %s", step_idx + 1, action)
             obs, reward, done, info = env.step(action, args.sleep_after_execution)
+            screenshot = _require_screenshot(obs, f"step {step_idx + 1}")
 
             logger.info("Reward: %.2f", reward)
             logger.info("Done: %s", done)
             # Save screenshot and trajectory information
             with open(os.path.join(example_result_dir, f"step_{step_idx + 1}_{action_timestamp}.png"),
                       "wb") as _f:
-                _f.write(obs['screenshot'])
+                _f.write(screenshot)
             with open(os.path.join(example_result_dir, "traj.jsonl"), "a") as f:
                 f.write(json.dumps({
                     "step_num": step_idx + 1,
@@ -115,6 +131,10 @@ def run_single_example(agent, env, example, max_steps, instruction, args, exampl
 def setup_logger(example, example_result_dir):
     runtime_logger = logging.getLogger(f"desktopenv.example.{example['id']}")
     runtime_logger.setLevel(logging.DEBUG)
+    for handler in list(runtime_logger.handlers):
+        if isinstance(handler, logging.FileHandler):
+            runtime_logger.removeHandler(handler)
+            handler.close()
     runtime_logger.addHandler(logging.FileHandler(os.path.join(example_result_dir, "runtime.log")))
     return runtime_logger
 

@@ -314,7 +314,10 @@ def parse_internal_response(
         process_tool_call_params(params)
 
     if not pyautogui_code:
-        pyautogui_code.append("FAIL" if infeasible_response else "DONE")
+        if "<tool_call" in response.lower():
+            pyautogui_code.append("WAIT")
+        else:
+            pyautogui_code.append("FAIL" if infeasible_response else "DONE")
 
     if not low_level_instruction and pyautogui_code:
         first_code = pyautogui_code[0]

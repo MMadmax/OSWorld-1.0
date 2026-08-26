@@ -5,6 +5,14 @@
   "source": "https://www.youtube.com/watch?v=ORrELERGIHs",
   "config": [
     {
+      "type": "install_packages",
+      "parameters": {
+        "packages": [
+          "jq"
+        ]
+      }
+    },
+    {
       "type": "command",
       "parameters": {
         "command": "SETTINGS_PATH=\"$HOME/.config/Code/User/settings.json\"; [ ! -f \"$SETTINGS_PATH\" ] && echo '{\"workbench.colorTheme\": \"Red\"}' > \"$SETTINGS_PATH\" || (grep -q \"workbench.colorTheme\" \"$SETTINGS_PATH\" && sed -i 's/\"workbench.colorTheme\": \"[^\"]*\"/\"workbench.colorTheme\": \"Red\"/' \"$SETTINGS_PATH\" || jq '. + {\"workbench.colorTheme\": \"Red\"}' \"$SETTINGS_PATH\" > temp.json && mv temp.json \"$SETTINGS_PATH\")",

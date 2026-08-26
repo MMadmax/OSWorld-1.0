@@ -40,13 +40,13 @@ fi
 # ─── Model gateway ──────────────────────────────────────────────────────────
 # Do not enable shell xtrace around this block: it contains credentials.
 export PHOENIX_TARGET="${PHOENIX_TARGET:-${API_BASE_OVERRIDE:-http://phoenix-gw-eval.alibaba.com/eval/dashscope}}"
-export PHOENIX_TENANT="${PHOENIX_TENANT:-phoenix-agent}"
+export PHOENIX_TENANT="${PHOENIX_TENANT:-icbu-dashscope-buyer-agent-algo}"
 export PHOENIX_EVAL_TOKEN="${PHOENIX_EVAL_TOKEN:-feccf2b0b1fb87a87faad9ac201744bd}"
-export PHOENIX_DOMAIN_PROXY="${PHOENIX_DOMAIN_PROXY:-https://iai.alibaba-inc.com}"
-export PHOENIX_EVAL_TIMEOUT="${PHOENIX_EVAL_TIMEOUT:-300}"
+export PHOENIX_DOMAIN_PROXY="${PHOENIX_DOMAIN_PROXY:-http://iai.vipserver:7001}"
+export PHOENIX_EVAL_TIMEOUT="${PHOENIX_EVAL_TIMEOUT:-1200}"
 # Bound the host-side HTTP call as well; the gateway timeout header alone does
 # not protect workers from a connection that remains open without a response.
-export OSWORLD_LLM_REQUEST_TIMEOUT="${OSWORLD_LLM_REQUEST_TIMEOUT:-180}"
+export OSWORLD_LLM_REQUEST_TIMEOUT="${OSWORLD_LLM_REQUEST_TIMEOUT:-1230}"
 # iai.alibaba-inc.com's unified ingress cuts off non-streaming requests after
 # 90 seconds. SSE keeps the connection active as model chunks arrive.
 export OSWORLD_LLM_STREAM="${OSWORLD_LLM_STREAM:-1}"
@@ -60,8 +60,8 @@ API_BASE="${API_BASE_OVERRIDE:-${PHOENIX_TARGET}}"
 # An explicitly supplied API_KEY wins. Values incidentally sourced from the
 # optional secrets file do not replace Phoenix's required pseudo-tenant.
 API_KEY="${API_KEY_OVERRIDE:-${PHOENIX_TENANT}}"
-EMP_ID="${EMP_ID:-${PHOENIX_EMP_ID:-454710}}"
-IAI_TAG="${IAI_TAG:-${PHOENIX_IAI_TAG:-accio_claw_data_syn}}"
+EMP_ID="${EMP_ID:-${PHOENIX_EMP_ID:-547066}}"
+IAI_TAG="${IAI_TAG:-${PHOENIX_IAI_TAG:-ale-test}}"
 
 if [[ -z "${API_KEY}" ]]; then
   echo "ERROR: API_KEY is required and must be the correct tenant for ${MODEL}." >&2
@@ -97,17 +97,21 @@ CLIENT_PASSWORD="${CLIENT_PASSWORD:-password}"
 
 OBSERVATION_TYPE="${OBSERVATION_TYPE:-screenshot}"
 ACTION_SPACE="${ACTION_SPACE:-pyautogui}"
-TEMPERATURE="${TEMPERATURE:-1.0}"
+TEMPERATURE="${TEMPERATURE:-0.0}"
 TOP_P="${TOP_P:-0.9}"
-MAX_TOKENS="${MAX_TOKENS:-16384}"
-MAX_STEPS="${MAX_STEPS:-15}"
-MAX_TRAJECTORY_LENGTH="${MAX_TRAJECTORY_LENGTH:-3}"
-SLEEP_AFTER_EXECUTION="${SLEEP_AFTER_EXECUTION:-3}"
+MAX_TOKENS="${MAX_TOKENS:-131072}"
+MAX_STEPS="${MAX_STEPS:-200}"
+HISTORY_N="${HISTORY_N:-100}"
+IMAGE_MAX="${IMAGE_MAX:-20}"
+FOLD_SIZE="${FOLD_SIZE:-10}"
+REASONING_EFFORT="${REASONING_EFFORT:-xhigh}"
+ENVIRONMENT_RETRIES="${ENVIRONMENT_RETRIES:-2}"
+SLEEP_AFTER_EXECUTION="${SLEEP_AFTER_EXECUTION:-0}"
 
 TEST_META_PATH="${TEST_META_PATH:-evaluation_examples/test_nogdrive.json}"
 DOMAIN="${DOMAIN:-all}"
 # run_multienv.py starts one worker process and one desktop VM per environment.
-NUM_ENVS="${NUM_ENVS:-20}"
+NUM_ENVS="${NUM_ENVS:-2}"
 RESULT_DIR="${RESULT_DIR:-/data/fengruixiang/CUA/OSWorld/output}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
 
@@ -151,7 +155,16 @@ RUN_ARGS=(
   --top_p "${TOP_P}"
   --max_tokens "${MAX_TOKENS}"
   --max_steps "${MAX_STEPS}"
-  --max_trajectory_length "${MAX_TRAJECTORY_LENGTH}"
+  --history_n "${HISTORY_N}"
+  --image_max "${IMAGE_MAX}"
+  --fold_size "${FOLD_SIZE}"
+  --enable_thinking
+  --reasoning_effort "${REASONING_EFFORT}"
+  --environment_retries "${ENVIRONMENT_RETRIES}"
+  --coord relative
+  --base_url "${API_BASE%/}"
+  --api_key "${API_KEY}"
+  --no-enable_proxy
   --sleep_after_execution "${SLEEP_AFTER_EXECUTION}"
   --test_all_meta_path "${TEST_META_PATH}"
   --domain "${DOMAIN}"
@@ -176,9 +189,9 @@ echo "  results:     ${RESULT_DIR}"
 
 if [[ "${DRY_RUN:-0}" == "1" ]]; then
   printf 'Command:'
-  printf ' %q' "${PYTHON_BIN}" scripts/python/run_multienv.py "${RUN_ARGS[@]}"
+  printf ' %q' "${PYTHON_BIN}" scripts/python/run_multienv_qwen.py "${RUN_ARGS[@]}"
   printf '\n'
   exit 0
 fi
 
-exec "${PYTHON_BIN}" scripts/python/run_multienv.py "${RUN_ARGS[@]}"
+exec "${PYTHON_BIN}" scripts/python/run_multienv_qwen.py "${RUN_ARGS[@]}"

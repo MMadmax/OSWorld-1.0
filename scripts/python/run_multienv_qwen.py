@@ -23,7 +23,9 @@ if os.path.exists(".env"):
 
 import lib_run_single
 from desktop_env.desktop_env import DesktopEnv
+from lib_run_single import RecoverableEnvironmentError
 from mm_agents.qwen import QwenAgent
+from mm_agents.transports import build_openai_compatible_transport
 
 
 active_environments = []
@@ -65,6 +67,7 @@ def config() -> argparse.Namespace:
         action="store_true",
         help="Enable model-side thinking. By default the runner sends enable_thinking=false in extra_body.",
     )
+    parser.add_argument("--reasoning_effort", type=str, default="xhigh")
 
     parser.add_argument("--model", type=str, default="qwen-vl")
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -79,6 +82,12 @@ def config() -> argparse.Namespace:
     parser.add_argument("--result_dir", type=str, default="./results")
     parser.add_argument("--simple_path", action="store_true")
     parser.add_argument("--num_envs", type=int, default=1)
+    parser.add_argument(
+        "--environment_retries",
+        type=int,
+        default=2,
+        help="Retry a task in a fresh environment after a recoverable desktop-service failure.",
+    )
     parser.add_argument(
         "--log_level",
         type=str,
@@ -197,9 +206,33 @@ def run_env_tasks(task_queue, run_args: argparse.Namespace, shared_scores: list)
         elif run_args.use_public_ip:
             logger.warning("DesktopEnv does not support use_public_ip; ignoring --use_public_ip.")
 
-        env = DesktopEnv(**env_kwargs)
-        active_environments.append(env)
-        logger.info("Created %s environment with enable_proxy=%s.", current_process().name, run_args.enable_proxy)
+        def create_environment():
+            created = DesktopEnv(**env_kwargs)
+            active_environments.append(created)
+            logger.info(
+                "Created %s environment with enable_proxy=%s.",
+                current_process().name,
+                run_args.enable_proxy,
+            )
+            return created
+
+        def restart_environment(current_env):
+            if current_env is not None:
+                try:
+                    current_env.close()
+                finally:
+                    try:
+                        active_environments.remove(current_env)
+                    except ValueError:
+                        pass
+            logger.warning(
+                "Recreating %s environment after desktop-service failure.",
+                current_process().name,
+            )
+            return create_environment()
+
+        env = create_environment()
+        transport = build_openai_compatible_transport()
 
         agent = QwenAgent(
             model=run_args.model,
@@ -214,8 +247,10 @@ def run_env_tasks(task_queue, run_args: argparse.Namespace, shared_scores: list)
             image_max=run_args.image_max,
             fold_size=run_args.fold_size,
             enable_thinking=run_args.enable_thinking,
+            reasoning_effort=run_args.reasoning_effort,
             base_url=run_args.base_url,
             api_key=run_args.api_key,
+            transport=transport,
         )
 
         logger.info("Process %s started with mm_agents.qwen.QwenAgent.", current_process().name)
@@ -226,7 +261,11 @@ def run_env_tasks(task_queue, run_args: argparse.Namespace, shared_scores: list)
             except Exception:
                 break
 
-            domain, example_id = item
+            if len(item) == 3:
+                domain, example_id, environment_retry = item
+            else:
+                domain, example_id = item
+                environment_retry = 0
             config_file = build_config_file_path(run_args, domain, example_id)
 
             with open(config_file, "r", encoding="utf-8") as file_obj:
@@ -251,6 +290,54 @@ def run_env_tasks(task_queue, run_args: argparse.Namespace, shared_scores: list)
                     example_result_dir,
                     shared_scores,
                 )
+            except RecoverableEnvironmentError as exc:
+                import traceback
+
+                logger.error(
+                    "Recoverable environment failure in %s %s/%s (attempt %d/%d): %s",
+                    current_process().name,
+                    domain,
+                    example_id,
+                    environment_retry + 1,
+                    run_args.environment_retries + 1,
+                    exc,
+                )
+                logger.error(traceback.format_exc())
+                try:
+                    env.controller.end_recording(
+                        os.path.join(example_result_dir, "recording.mp4")
+                    )
+                except Exception:
+                    pass
+
+                if environment_retry < run_args.environment_retries:
+                    archive_root = os.path.join(
+                        run_args.result_dir,
+                        "_recoverable_attempts",
+                        domain,
+                        example_id,
+                    )
+                    os.makedirs(archive_root, exist_ok=True)
+                    archive_path = os.path.join(
+                        archive_root,
+                        f"attempt_{environment_retry + 1}_{datetime.datetime.now().strftime('%Y%m%d@%H%M%S')}",
+                    )
+                    if os.path.isdir(example_result_dir):
+                        shutil.move(example_result_dir, archive_path)
+                    task_queue.put((domain, example_id, environment_retry + 1))
+                    logger.warning(
+                        "Requeued %s/%s after archiving the failed attempt to %s.",
+                        domain,
+                        example_id,
+                        archive_path,
+                    )
+                else:
+                    logger.error(
+                        "Environment retry limit exhausted for %s/%s; leaving it unfinished.",
+                        domain,
+                        example_id,
+                    )
+                env = restart_environment(env)
             except Exception as exc:
                 import traceback
 

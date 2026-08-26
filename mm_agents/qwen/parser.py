@@ -24,7 +24,12 @@ def parse_xml_tool_call(xml_content: str) -> Optional[Dict]:
 
 
 def iter_tool_call_params(response: str):
-    for tool_call_match in re.finditer(r"<tool_call>(.*?)</tool_call>", response, re.DOTALL):
+    normalized = re.sub(
+        r"</function_call\s*>", "</tool_call>", response, flags=re.IGNORECASE
+    )
+    for tool_call_match in re.finditer(
+        r"<tool_call>(.*?)</tool_call>", normalized, re.DOTALL | re.IGNORECASE
+    ):
         params = parse_xml_tool_call(tool_call_match.group(1))
         if params:
             yield params

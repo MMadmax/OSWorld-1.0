@@ -1,9 +1,12 @@
 import logging
 import os
+import time
 from typing import Dict, List, Optional, Tuple
 
 from .actions import parse_base_response, parse_internal_response, py_string
-from .client import call_openai_compatible
+from mm_agents.transports import LLMTransport
+
+from .client import MAX_RETRY_TIMES, call_openai_compatible, merge_reasoning_content
 from .history import (
     build_messages,
     dump_debug_messages,
@@ -55,6 +58,7 @@ class _QwenBaseAgent:
         collapse_text: Optional[str] = None,
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
+        transport: Optional[LLMTransport] = None,
     ):
         self.platform = platform
         self.model = model
@@ -72,6 +76,7 @@ class _QwenBaseAgent:
         self.collapse_text = collapse_text or self.COLLAPSED_SCREENSHOT_TEXT
         self.base_url = base_url
         self.api_key = api_key
+        self.transport = transport
 
         if action_space != "pyautogui":
             raise ValueError("QwenAgent supports only pyautogui action space")
@@ -138,6 +143,13 @@ class _QwenBaseAgent:
         )
 
     def predict(self, instruction: str, obs: Dict) -> Tuple[str, List[str]]:
+        state_lengths = {
+            "screenshots": len(self.screenshots),
+            "observations": len(self.observations),
+            "responses": len(self.responses),
+            "actions": len(self.actions),
+        }
+        previous_folded_prefix_k = self.folded_prefix_k
         screenshot_bytes = obs["screenshot"]
 
         original_width, original_height = image_size_from_bytes(screenshot_bytes)
@@ -180,6 +192,15 @@ class _QwenBaseAgent:
 
         if logger:
             logger.info("%s Output: %s", self._log_prefix(), response)
+        if not isinstance(response, str) or not response.strip():
+            # lib_run_single retries an empty response without consuming a benchmark
+            # step. Restore the agent history so that retry is truly the same step.
+            del self.screenshots[state_lengths["screenshots"] :]
+            del self.observations[state_lengths["observations"] :]
+            del self.responses[state_lengths["responses"] :]
+            del self.actions[state_lengths["actions"] :]
+            self.folded_prefix_k = previous_folded_prefix_k
+            return "", []
         self.responses.append(response or "")
 
         low_level_instruction, pyautogui_code = self._parse_response(
@@ -215,6 +236,27 @@ class _QwenBaseAgent:
         )
 
     def call_llm(self, payload: Dict, model: str) -> str:
+        if self.transport is not None:
+            last_error = None
+            for attempt in range(1, MAX_RETRY_TIMES + 1):
+                try:
+                    result = self.transport.complete(payload)
+                    return merge_reasoning_content(
+                        result.content,
+                        result.reasoning_content,
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    if logger:
+                        logger.warning(
+                            "[QwenAgent] transport failed attempt %d/%d: %s",
+                            attempt,
+                            MAX_RETRY_TIMES,
+                            exc,
+                        )
+                    if attempt < MAX_RETRY_TIMES:
+                        time.sleep(min(5.0 * attempt, 30.0))
+            raise last_error
         return call_openai_compatible(
             payload,
             model,
@@ -244,11 +286,13 @@ class QwenAgent(_QwenBaseAgent):
         self,
         *args,
         enable_thinking: bool = False,
+        reasoning_effort: str = "xhigh",
         observation_type: str = "screenshot",
         **kwargs,
     ):
         super().__init__(*args, observation_type="screenshot", **kwargs)
         self.enable_thinking = enable_thinking
+        self.reasoning_effort = reasoning_effort
         if observation_type != "screenshot":
             raise ValueError("QwenAgent supports only screenshot observations")
         self.observation_type = observation_type
@@ -267,11 +311,9 @@ class QwenAgent(_QwenBaseAgent):
 
     def _build_payload(self, messages: List[Dict]) -> Dict:
         payload = super()._build_payload(messages)
-        base_url = self.base_url or os.environ.get("OPENAI_BASE_URL", "")
-        if "dashscope" in base_url.lower():
-            extra_body = dict(payload.get("extra_body") or {})
-            extra_body["enable_thinking"] = bool(self.enable_thinking)
-            payload["extra_body"] = extra_body
+        payload["enable_thinking"] = bool(self.enable_thinking)
+        if self.enable_thinking and self.reasoning_effort:
+            payload["reasoning_effort"] = self.reasoning_effort
         return payload
 
     def _log_prefix(self) -> str:

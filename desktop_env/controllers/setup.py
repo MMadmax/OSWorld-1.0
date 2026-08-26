@@ -48,6 +48,91 @@ def _redact_command_for_log(command: Union[str, List[str]]) -> str:
     return text
 
 
+_PACKAGE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+.-]*$")
+_APT_LOCK_FILES = (
+    "/var/lib/apt/lists/lock",
+    "/var/cache/apt/archives/lock",
+    "/var/lib/dpkg/lock",
+    "/var/lib/dpkg/lock-frontend",
+)
+
+
+def _build_install_packages_command(
+    packages: List[str],
+    client_password: str,
+    lock_timeout_s: int = 120,
+) -> str:
+    """Build a guest package install resilient to PackageKit/apt lock races."""
+    if not packages:
+        raise ValueError("install_packages requires at least one package")
+    invalid = [package for package in packages if not _PACKAGE_NAME_RE.fullmatch(package)]
+    if invalid:
+        raise ValueError(f"Invalid apt package name(s): {invalid}")
+    if lock_timeout_s <= 0:
+        raise ValueError("lock_timeout_s must be positive")
+
+    quoted_packages = " ".join(shlex.quote(package) for package in packages)
+    quoted_password = shlex.quote(client_password)
+    quoted_locks = " ".join(shlex.quote(path) for path in _APT_LOCK_FILES)
+    return f"""set -eu
+_osworld_sudo_password={quoted_password}
+_osworld_sudo() {{
+  printf '%s\\n' "$_osworld_sudo_password" | sudo -S -p '' "$@"
+}}
+_osworld_wait_for_apt_locks() {{
+  _osworld_waited=0
+  while :; do
+    _osworld_busy=0
+    for _osworld_lock in {quoted_locks}; do
+      if _osworld_sudo fuser "$_osworld_lock" >/dev/null 2>&1; then
+        _osworld_busy=1
+        break
+      fi
+    done
+    if [ "$_osworld_busy" -eq 0 ]; then return 0; fi
+    if [ "$_osworld_waited" -ge {lock_timeout_s} ]; then
+      echo "Timed out waiting for apt/dpkg locks after {lock_timeout_s}s" >&2
+      return 1
+    fi
+    sleep 1
+    _osworld_waited=$((_osworld_waited + 1))
+  done
+}}
+_osworld_apt_retry() {{
+  _osworld_attempt=1
+  while [ "$_osworld_attempt" -le 3 ]; do
+    _osworld_wait_for_apt_locks
+    if _osworld_sudo env DEBIAN_FRONTEND=noninteractive apt-get \
+      -o DPkg::Lock::Timeout={lock_timeout_s} \
+      -o Acquire::Retries=3 \
+      -o Acquire::http::Timeout=60 \
+      -o Acquire::https::Timeout=60 "$@"; then
+      return 0
+    fi
+    if [ "$_osworld_attempt" -lt 3 ]; then sleep $((_osworld_attempt * 3)); fi
+    _osworld_attempt=$((_osworld_attempt + 1))
+  done
+  echo "apt-get failed after 3 attempts: $*" >&2
+  return 1
+}}
+
+_osworld_sudo systemctl stop packagekit.service >/dev/null 2>&1 || true
+_osworld_missing=""
+for _osworld_package in {quoted_packages}; do
+  if ! dpkg-query -W -f='${{Status}}' "$_osworld_package" 2>/dev/null | grep -qx 'install ok installed'; then
+    _osworld_missing="$_osworld_missing $_osworld_package"
+  fi
+done
+if [ -z "$_osworld_missing" ]; then
+  echo "Requested packages already installed: {quoted_packages}"
+  exit 0
+fi
+echo "Installing missing packages:$_osworld_missing"
+_osworld_apt_retry update
+_osworld_apt_retry install -y $_osworld_missing
+"""
+
+
 CHROME_CDP_READY_TIMEOUT_S = float(os.getenv("OSWORLD_CHROME_CDP_READY_TIMEOUT_S", "120"))
 CHROME_STDERR_LOG = os.getenv("OSWORLD_CHROME_STDERR_LOG", "/tmp/osworld_chrome_stderr.log")
 CHROME_DEVTOOLS_LISTENING_MARKER = "DevTools listening on ws://"
@@ -516,6 +601,7 @@ class SetupController:
             terminates = terminates or nb_failings >= 5
             if not terminates:
                 time.sleep(0.3)
+        return results
 
     def _execute_with_verification_setup(
             self,
@@ -570,6 +656,21 @@ class SetupController:
 
     def _command_setup(self, command: List[str], **kwargs):
         self._execute_setup(command, **kwargs)
+
+    def _install_packages_setup(
+        self,
+        packages: List[str],
+        lock_timeout_s: int = 120,
+    ):
+        command = _build_install_packages_command(
+            packages,
+            self.client_password,
+            lock_timeout_s=lock_timeout_s,
+        )
+        result = self._execute_setup(command, shell=True)
+        if result is None or result.get("returncode") != 0:
+            error = (result or {}).get("error", "no response from guest")
+            raise RuntimeError(f"Guest package installation failed: {error}")
 
     def _sleep_setup(self, seconds: float):
         time.sleep(seconds)
@@ -655,11 +756,11 @@ class SetupController:
         # Format proxy URL
         proxy_url = proxy_pool._format_proxy_url(current_proxy)
         logger.info(f"Setting up proxy: {current_proxy.host}:{current_proxy.port}")
+
+        self._install_packages_setup(["tinyproxy"])
         
         # Configure system proxy environment variables  
         proxy_commands = [
-            f"echo '{client_password}' | sudo -S bash -c \"apt-get update\"", ## TODO: remove this line if ami is already updated
-            f"echo '{client_password}' | sudo -S bash -c \"apt-get install -y tinyproxy\"", ## TODO: remove this line if tinyproxy is already installed
             f"echo '{client_password}' | sudo -S bash -c \"echo 'Port 18888' > /tmp/tinyproxy.conf\"",
             f"echo '{client_password}' | sudo -S bash -c \"echo 'Allow 127.0.0.1' >> /tmp/tinyproxy.conf\"",
             f"echo '{client_password}' | sudo -S bash -c \"echo 'Upstream http {current_proxy.username}:{current_proxy.password}@{current_proxy.host}:{current_proxy.port}' >> /tmp/tinyproxy.conf\"",

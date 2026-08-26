@@ -98,7 +98,10 @@ def call_openai_compatible(
                 temperature=payload.get("temperature", default_temperature),
                 top_p=payload.get("top_p", default_top_p),
             )
-            extra_body = payload.get("extra_body")
+            extra_body = dict(payload.get("extra_body") or {})
+            for key in ("enable_thinking", "reasoning_effort", "preserve_thinking"):
+                if key in payload:
+                    extra_body[key] = payload[key]
             if extra_body:
                 create_kwargs["extra_body"] = extra_body
             response = client.chat.completions.create(**create_kwargs)

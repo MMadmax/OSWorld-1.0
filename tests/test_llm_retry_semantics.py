@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import tempfile
 import unittest
@@ -7,6 +8,8 @@ from unittest.mock import patch
 
 from lib_run_single import LLMRetryExhaustedError, run_single_example
 from mm_agents.agent import PromptAgent
+from mm_agents.qwen.main import QwenAgent
+from PIL import Image
 
 
 class FakeController:
@@ -179,6 +182,25 @@ class PredictionRollbackTest(unittest.TestCase):
         self.assertEqual(len(agent.observations), 1)
         self.assertEqual(len(agent.actions), 1)
         self.assertEqual(len(agent.thoughts), 1)
+
+    def test_qwen_empty_response_rolls_back_agent_history(self):
+        image = io.BytesIO()
+        Image.new("RGB", (16, 16), "white").save(image, format="PNG")
+        agent = QwenAgent(model="qwen3.8-max")
+        agent.call_llm = lambda _payload, _model: ""
+
+        response, actions = agent.predict(
+            "test instruction",
+            {"screenshot": image.getvalue()},
+        )
+
+        self.assertEqual(response, "")
+        self.assertEqual(actions, [])
+        self.assertEqual(agent.screenshots, [])
+        self.assertEqual(agent.observations, [])
+        self.assertEqual(agent.responses, [])
+        self.assertEqual(agent.actions, [])
+        self.assertEqual(agent.folded_prefix_k, 0)
 
 
 if __name__ == "__main__":

@@ -19,10 +19,11 @@
   "evaluator": {
     "postconfig": [
       {
-        "type": "execute",
+        "type": "install_packages",
         "parameters": {
-          "command": "echo {CLIENT_PASSWORD} | sudo -S apt-get install -y expect",
-          "shell": true
+          "packages": [
+            "expect"
+          ]
         }
       },
       {

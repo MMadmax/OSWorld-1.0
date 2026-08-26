@@ -4,6 +4,7 @@ import datetime
 import json
 import logging
 import os
+import shutil
 import sys
 import signal
 import time
@@ -15,8 +16,10 @@ from multiprocessing import current_process
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 import lib_run_single
+from lib_run_single import RecoverableEnvironmentError
 from desktop_env.desktop_env import DesktopEnv
 from mm_agents.agent import PromptAgent
+from mm_agents.transports import build_openai_compatible_transport
 
 # Global variables for signal handling
 active_environments = []
@@ -84,6 +87,12 @@ def config() -> argparse.Namespace:
     # logging related
     parser.add_argument("--result_dir", type=str, default="./results")
     parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to run in parallel")  
+    parser.add_argument(
+        "--environment_retries",
+        type=int,
+        default=2,
+        help="Number of times to recreate the container and requeue a task after a screenshot-service failure",
+    )
     parser.add_argument("--log_level", type=str, choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], 
                        default='INFO', help="Set the logging level")
     # aws config
@@ -199,8 +208,34 @@ def run_env_tasks(task_queue: Queue, args: argparse.Namespace, shared_scores: li
             snapshot_name = os.environ.get("DAYTONA_OSWORLD_SNAPSHOT")
             if snapshot_name:
                 env_kwargs["snapshot_name"] = snapshot_name
-        env = DesktopEnv(**env_kwargs)
-        active_environments.append(env)
+        def create_environment():
+            created = DesktopEnv(**env_kwargs)
+            active_environments.append(created)
+            logger.info("Created %s environment.", current_process().name)
+            return created
+
+        def restart_environment(current_env):
+            if current_env is not None:
+                try:
+                    current_env.close()
+                finally:
+                    try:
+                        active_environments.remove(current_env)
+                    except ValueError:
+                        pass
+            logger.warning(
+                "Recreating %s environment after desktop-service failure.",
+                current_process().name,
+            )
+            return create_environment()
+
+        env = create_environment()
+        transport = (
+            build_openai_compatible_transport()
+            if os.environ.get("OSWORLD_OPENAI_COMPATIBLE", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+            else None
+        )
         agent = PromptAgent(
             model=args.model,
             max_tokens=args.max_tokens,
@@ -209,7 +244,8 @@ def run_env_tasks(task_queue: Queue, args: argparse.Namespace, shared_scores: li
             action_space=args.action_space,
             observation_type=args.observation_type,
             max_trajectory_length=args.max_trajectory_length,
-            client_password=args.client_password
+            client_password=args.client_password,
+            transport=transport,
         )
 
         logger.info(f"Process {current_process().name} started.")
@@ -218,7 +254,11 @@ def run_env_tasks(task_queue: Queue, args: argparse.Namespace, shared_scores: li
                 item = task_queue.get(timeout=5)
             except Exception:
                 break
-            domain, example_id = item
+            if len(item) == 3:
+                domain, example_id, environment_retry = item
+            else:
+                domain, example_id = item
+                environment_retry = 0
             try:
                 config_file = os.path.join(
                     args.test_config_base_dir, f"examples/{domain}/{example_id}.json"
@@ -248,6 +288,57 @@ def run_env_tasks(task_queue: Queue, args: argparse.Namespace, shared_scores: li
                         example_result_dir,
                         shared_scores,
                     )
+                except RecoverableEnvironmentError as e:
+                    import traceback
+
+                    logger.error(
+                        "Recoverable environment failure in %s %s/%s (attempt %d/%d): %s",
+                        current_process().name,
+                        domain,
+                        example_id,
+                        environment_retry + 1,
+                        args.environment_retries + 1,
+                        e,
+                    )
+                    logger.error(traceback.format_exc())
+                    try:
+                        env.controller.end_recording(
+                            os.path.join(example_result_dir, "recording.mp4")
+                        )
+                    except Exception:
+                        pass
+
+                    if environment_retry < args.environment_retries:
+                        archive_root = os.path.join(
+                            args.result_dir,
+                            "_recoverable_attempts",
+                            domain,
+                            example_id,
+                        )
+                        os.makedirs(archive_root, exist_ok=True)
+                        archive_path = os.path.join(
+                            archive_root,
+                            "attempt_{}_{}".format(
+                                environment_retry + 1,
+                                datetime.datetime.now().strftime("%Y%m%d@%H%M%S"),
+                            ),
+                        )
+                        if os.path.isdir(example_result_dir):
+                            shutil.move(example_result_dir, archive_path)
+                        task_queue.put((domain, example_id, environment_retry + 1))
+                        logger.warning(
+                            "Requeued %s/%s after archiving the failed attempt to %s.",
+                            domain,
+                            example_id,
+                            archive_path,
+                        )
+                    else:
+                        logger.error(
+                            "Environment retry limit exhausted for %s/%s; leaving it unfinished.",
+                            domain,
+                            example_id,
+                        )
+                    env = restart_environment(env)
                 except Exception as e:
                     import traceback
                     logger.error(f"Exception in {current_process().name} {domain}/{example_id}: {e}")

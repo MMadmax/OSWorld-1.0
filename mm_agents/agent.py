@@ -27,99 +27,15 @@ from mm_agents.prompts import SYS_PROMPT_IN_SCREENSHOT_OUT_CODE, SYS_PROMPT_IN_S
     SYS_PROMPT_IN_A11Y_OUT_CODE, SYS_PROMPT_IN_A11Y_OUT_ACTION, \
     SYS_PROMPT_IN_BOTH_OUT_CODE, SYS_PROMPT_IN_BOTH_OUT_ACTION, \
     SYS_PROMPT_IN_SOM_OUT_TAG
+from mm_agents.transports import (
+    build_openai_compatible_transport,
+    consume_openai_stream,
+    ensure_json_llm_response,
+)
 
 logger = logging.getLogger("desktopenv.agent")
 
 pure_text_settings = ['a11y_tree']
-
-
-def ensure_json_llm_response(response, endpoint):
-    """Fail with gateway diagnostics before attempting to parse an HTML body."""
-    content_type = response.headers.get("content-type", "")
-    if "application/json" in content_type.lower():
-        return
-
-    body_prefix = response.text[:4096]
-    waf_uuid_match = re.search(
-        r"(?:[?&]|\b)uuid=([0-9a-fA-F]{16,64})",
-        body_prefix,
-    )
-    waf_uuid = waf_uuid_match.group(1) if waf_uuid_match else None
-    raise RuntimeError(
-        "Non-JSON response from OpenAI-compatible endpoint: "
-        f"endpoint={endpoint}, "
-        f"status={response.status_code}, "
-        f"content_type={content_type or None}, "
-        f"server={response.headers.get('server')}, "
-        f"bxpunish={response.headers.get('bxpunish')}, "
-        f"traceid={response.headers.get('eagleeye-traceid')}, "
-        f"waf_uuid={waf_uuid}"
-    )
-
-
-def consume_openai_stream(response, endpoint):
-    """Consume an OpenAI-compatible SSE response and return its text."""
-    content_type = response.headers.get("content-type", "").lower()
-    logger.info("Opened LLM stream: content_type=%s", content_type or None)
-    if "application/json" in content_type:
-        try:
-            return response.json()["choices"][0]["message"]["content"]
-        finally:
-            response.close()
-    if "text/event-stream" not in content_type:
-        try:
-            ensure_json_llm_response(response, endpoint)
-        finally:
-            response.close()
-
-    content_parts = []
-    saw_event = False
-    try:
-        for raw_line in response.iter_lines(decode_unicode=True):
-            if not raw_line:
-                continue
-            if isinstance(raw_line, bytes):
-                raw_line = raw_line.decode("utf-8", errors="replace")
-            line = raw_line.strip()
-            if not line or line.startswith(":") or not line.startswith("data:"):
-                continue
-
-            data = line[5:].strip()
-            if data == "[DONE]":
-                break
-
-            event = json.loads(data)
-            if not saw_event:
-                logger.info("Received first LLM stream event")
-            saw_event = True
-            if event.get("error"):
-                raise RuntimeError(
-                    f"Streaming error from OpenAI-compatible endpoint: {event['error']}"
-                )
-
-            for choice in event.get("choices", []):
-                delta = choice.get("delta") or {}
-                content = delta.get("content")
-                if content is None:
-                    message = choice.get("message") or {}
-                    content = message.get("content")
-                if isinstance(content, str):
-                    content_parts.append(content)
-                elif isinstance(content, list):
-                    content_parts.extend(
-                        part.get("text", "")
-                        for part in content
-                        if isinstance(part, dict) and part.get("type") == "text"
-                    )
-    finally:
-        response.close()
-
-    if content_parts:
-        return "".join(content_parts)
-    raise RuntimeError(
-        "OpenAI-compatible stream ended without content: "
-        f"endpoint={endpoint}, saw_event={saw_event}"
-    )
 
 attributes_ns_ubuntu = "https://accessibility.windows.example.org/ns/attributes"
 attributes_ns_windows = "https://accessibility.windows.example.org/ns/attributes"
@@ -325,7 +241,8 @@ class PromptAgent:
             # observation_type can be in ["screenshot", "a11y_tree", "screenshot_a11y_tree", "som"]
             max_trajectory_length=3,
             a11y_tree_max_tokens=10000,
-            client_password="password"
+            client_password="password",
+            transport=None,
     ):
         self.platform = platform
         self.model = model
@@ -337,6 +254,7 @@ class PromptAgent:
         self.max_trajectory_length = max_trajectory_length
         self.a11y_tree_max_tokens = a11y_tree_max_tokens
         self.client_password = client_password
+        self.transport = transport
 
         self.thoughts = []
         self.actions = []
@@ -725,104 +643,19 @@ class PromptAgent:
         elif self.model.startswith("gpt") or os.environ.get(
             "OSWORLD_OPENAI_COMPATIBLE", ""
         ).strip().lower() in {"1", "true", "yes", "on"}:
-            # Support custom OpenAI base URL via environment variable
-            base_url = os.environ.get('OPENAI_BASE_URL', 'https://api.openai.com')
-            # Some OpenAI-compatible gateways (including IAI/DashScope) do not
-            # use a /v1 prefix. Let launchers provide the exact endpoint while
-            # preserving the existing OpenAI URL behavior by default.
-            api_url = os.environ.get("OSWORLD_OPENAI_CHAT_COMPLETIONS_URL")
-            if not api_url:
-                api_url = (
-                    f"{base_url}/chat/completions"
-                    if base_url.endswith('/v1')
-                    else f"{base_url}/v1/chat/completions"
-                )
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"
-            }
-
-            # IAI requires both headers for attribution and cost tracking.
-            # They are opt-in environment settings so ordinary OpenAI callers
-            # keep exactly the same request headers as before.
-            emp_id = os.environ.get("OSWORLD_EMP_ID")
-            iai_tag = os.environ.get("OSWORLD_IAI_TAG")
-            if emp_id:
-                headers["empId"] = emp_id
-            if iai_tag:
-                headers["iai-tag"] = iai_tag
-
-            # Phoenix evaluation gateway routing/authentication. The launcher
-            # exports these values so they are sent as request headers instead
-            # of merely existing in the OSWorld process environment.
-            phoenix_eval_token = os.environ.get("PHOENIX_EVAL_TOKEN")
-            phoenix_domain_proxy = os.environ.get("PHOENIX_DOMAIN_PROXY")
-            phoenix_timeout = os.environ.get("PHOENIX_EVAL_TIMEOUT")
-            backend_trajectory_id = (
-                os.environ.get("OSWORLD_BACKEND_TRAJECTORY_ID")
-                or os.environ.get("SANDBOX_TRAJECTORY_ID")
-            )
-            if phoenix_eval_token:
-                headers["x-eval-token"] = phoenix_eval_token
-            if phoenix_domain_proxy:
-                headers["x-eval-domain-proxy"] = phoenix_domain_proxy
-            if phoenix_timeout:
-                headers["x-eval-timeout"] = phoenix_timeout
-            if backend_trajectory_id:
-                # Phoenix's rl-router requires this header when proxying
-                # /eval/v1/* requests to an SGLang backend.  Keep it opt-in so
-                # the existing DashScope route is unchanged.
-                headers["X-Backend-TrajectoryID"] = backend_trajectory_id
-            request_timeout = float(
-                os.environ.get("OSWORLD_LLM_REQUEST_TIMEOUT", "180")
-            )
-            use_stream = os.environ.get(
-                "OSWORLD_LLM_STREAM", ""
-            ).strip().lower() in {"1", "true", "yes", "on"}
-            if use_stream:
-                headers["Accept"] = "text/event-stream"
-
-            def post_chat_completions(current_payload):
-                request_payload = dict(current_payload)
-                if use_stream:
-                    request_payload["stream"] = True
-                return requests.post(
-                    api_url,
-                    headers=headers,
-                    json=request_payload,
-                    timeout=request_timeout,
-                    stream=use_stream,
-                )
-
-            def read_successful_response(current_response):
-                if use_stream:
-                    return consume_openai_stream(current_response, api_url)
-                ensure_json_llm_response(current_response, api_url)
-                return current_response.json()["choices"][0]["message"]["content"]
-
             logger.info("Generating content with GPT model: %s", self.model)
-            response = post_chat_completions(payload)
-
-            if response.status_code == 200:
-                return read_successful_response(response)
-
-            ensure_json_llm_response(response, api_url)
-            if response.json()['error']['code'] == "context_length_exceeded":
-                logger.error("Context length exceeded. Retrying with a smaller context.")
-                payload["messages"] = [payload["messages"][0]] + payload["messages"][-1:]
-                retry_response = post_chat_completions(payload)
-                if retry_response.status_code == 200:
-                    return read_successful_response(retry_response)
-                ensure_json_llm_response(retry_response, api_url)
-                logger.error(
-                    "Failed to call LLM even after attempt on shortening the history: "
-                    + retry_response.text
+            if self.transport is None:
+                self.transport = build_openai_compatible_transport()
+            result = self.transport.complete(payload)
+            content = result.content
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                return "".join(
+                    str(part.get("text", "")) if isinstance(part, dict) else str(part)
+                    for part in content
                 )
-                return ""
-
-            logger.error("Failed to call LLM: " + response.text)
-            time.sleep(5)
-            return ""
+            return "" if content is None else str(content)
 
         elif self.model.startswith("claude"):
             messages = payload["messages"]
