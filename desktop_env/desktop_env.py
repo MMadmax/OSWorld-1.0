@@ -24,6 +24,9 @@ VMSecretMount = Union[str, Tuple[str, str], Dict[str, str]]
 
 MAX_RETRIES = 5 # Maximum retries for environment setup
 
+_DOCKER_XCURSOR_PATCH_ENV = "OSWORLD_DOCKER_XCURSOR_PATCH"
+_DOCKER_XCURSOR_RELOAD_DELAY_ENV = "OSWORLD_DOCKER_XCURSOR_RELOAD_DELAY"
+
 
 def _env_vm_secret_mounts() -> List[VMSecretMount]:
     raw_mounts = os.environ.get("OSWORLD_VM_SECRET_MOUNTS", "").strip()
@@ -216,6 +219,7 @@ class DesktopEnv(gym.Env):
                 self.vlc_port = int(vm_ip_ports[4])
             self.controller = PythonController(vm_ip=self.vm_ip, server_port=self.server_port)
             self.setup_controller = SetupController(vm_ip=self.vm_ip, server_port=self.server_port, chromium_port=self.chromium_port, vlc_port=self.vlc_port, cache_dir=self.cache_dir_base, client_password=self.client_password, screen_width=self.screen_width, screen_height=self.screen_height)
+            self._inject_docker_xcursor_patch()
             self._inject_vm_secret_mounts()
 
         except Exception as e:
@@ -224,6 +228,54 @@ class DesktopEnv(gym.Env):
             except Exception as stop_err:
                 logger.warning(f"Cleanup after interrupt failed: {stop_err}")
             raise
+
+    def _inject_docker_xcursor_patch(self):
+        """Install the Xcursor Display cleanup fix into a fresh Docker VM.
+
+        The published Docker qcow image opens a new X11 Display for every
+        screenshot without closing it. Keep the original per-action execution
+        and screenshot behavior unchanged; only replace that helper with the
+        repository copy, whose destructor closes the Display. Flask's debug
+        reloader reloads the imported helper after upload.
+        """
+        if self.provider_name != "docker":
+            return
+
+        enabled = os.environ.get(_DOCKER_XCURSOR_PATCH_ENV, "1").strip().lower()
+        if enabled in {"0", "false", "no", "off"}:
+            logger.warning(
+                "Docker Xcursor runtime patch is disabled via %s.",
+                _DOCKER_XCURSOR_PATCH_ENV,
+            )
+            return
+
+        local_patch = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "server",
+            "pyxcursor.py",
+        )
+        guest_patch = "/home/user/server/pyxcursor.py"
+        logger.info("Installing Docker Xcursor cleanup patch in the guest VM.")
+        self.setup_controller._upload_file_setup([
+            {"local_path": local_patch, "path": guest_patch}
+        ])
+
+        # The image runs Flask with the Werkzeug reloader. Give it one scan
+        # interval, then require a fresh screenshot before allowing task setup.
+        reload_delay = float(
+            os.environ.get(_DOCKER_XCURSOR_RELOAD_DELAY_ENV, "2")
+        )
+        if reload_delay < 0:
+            raise ValueError(
+                f"{_DOCKER_XCURSOR_RELOAD_DELAY_ENV} must be non-negative"
+            )
+        time.sleep(reload_delay)
+        if self.controller.get_screenshot() is None:
+            raise RuntimeError(
+                "Docker OSWorld server did not recover after installing the "
+                "Xcursor cleanup patch"
+            )
+        logger.info("Docker Xcursor cleanup patch is active.")
 
     def _inject_vm_secret_mounts(self):
         if not self.vm_secret_mounts:
